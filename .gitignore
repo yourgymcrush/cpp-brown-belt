@@ -1,0 +1,52 @@
+*
+
+!*.*
+!*/
+
+.DS_Store
+._.DS_Store
+*.o
+*.out
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Backup files
+*.bak
+
+# Project build directory
+build/
+
+# Project temp files
+.clangd/
+compile_commands.json
