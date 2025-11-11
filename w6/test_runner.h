@@ -39,6 +39,13 @@ ostream& operator << (ostream& os, const set<T>& s) {
   return os << "}";
 }
 
+template <class T>
+ostream& operator << (ostream& os, const pair<T, T>& p) {
+  os << "{";
+  os << p.first << ", " << p.second;
+  return os << "}";
+}
+
 template <class K, class V>
 ostream& operator << (ostream& os, const map<K, V>& m) {
   os << "{";
