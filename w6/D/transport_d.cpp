@@ -11,8 +11,10 @@
 #include <unordered_set>
 #include <charconv>
 #include <functional> 
+#include <fstream> 
 
 #include "../test_runner.h"
+#include "json.h"
 
 constexpr double P = 3.1415926535;
 constexpr int EarthR = 6371;
@@ -155,6 +157,7 @@ struct Request {
     }
     static RequestHolder Create(Type type, Option option);
     virtual void ParseFrom(std::string_view input) = 0;
+    virtual void ParseFromJson(const Json::Node& node) = 0;
     virtual ~Request() = default;
 
     const Type type;
@@ -170,7 +173,14 @@ struct PostRequest : Request
 struct GetRequest : Request
 {
     GetRequest(Option option) : Request(Type::GET, option) {}
-    virtual std::string Process(const DB& db) const = 0;
+    virtual Json::Node Process(const DB& db) const = 0;
+
+    virtual void GetId(const Json::Node& node)
+    {   
+        auto data = node.AsMap();
+        id = data.at("id").AsInt();
+    }
+    size_t id;
 };
 
 struct BusRequest
@@ -223,15 +233,37 @@ struct PostBusRequest : PostRequest, BusRequest
         }
         if (route.type == Route::Type::LINEAR)
         {
-            std::vector<std::string> stops = route.stops;
-            
-            stops.reserve(route.stops.size() * 2 - 1);
-            for (auto it = route.stops.rbegin() + 1; it != route.stops.rend(); it++)
-            {
-                stops.push_back(*it);
-            }
-            route.stops = std::move(stops);
+            AddBackRoute();
         }
+    }
+    virtual void ParseFromJson(const Json::Node& node) override
+    {
+        auto data = node.AsMap();
+        route.bus_number = std::stoi(data.at("name").AsString());
+        route.type = data.at("is_roundtrip").AsBool() ? Route::Type::CIRCLE : Route::Type::LINEAR;
+
+        auto stops = data.at("stops").AsArray();
+
+        for (auto& stop : stops)
+        {
+            route.stops.push_back(stop.AsString());
+        }
+        if (route.type == Route::Type::LINEAR)
+        {
+            AddBackRoute();
+        }
+    }
+
+    void AddBackRoute()
+    {
+        std::vector<std::string> stops = route.stops;
+        
+        stops.reserve(route.stops.size() * 2 - 1);
+        for (auto it = route.stops.rbegin() + 1; it != route.stops.rend(); it++)
+        {
+            stops.push_back(*it);
+        }
+        route.stops = std::move(stops);
     }
 
     virtual void Process(DB& db) const override;
@@ -269,6 +301,20 @@ struct PostStopRequest : PostRequest, StopRequest
         }
     }
 
+    virtual void ParseFromJson(const Json::Node& node) override
+    {
+        auto data = node.AsMap();
+        stop.name = data.at("name").AsString();
+        stop.coords.first = data.at("longitude").AsDouble();
+        stop.coords.second = data.at("latitude").AsDouble();
+
+        auto nearbyStopData = data.at("road_distances").AsMap();
+        for (const auto& [stopName, distance] : nearbyStopData)
+        {
+            stop.nearbyStops[stopName] = distance.AsInt();
+        }
+    }
+
     virtual void Process(DB& db) const override;
 
     Stop stop;
@@ -281,8 +327,14 @@ struct GetBusRequest : GetRequest, BusRequest
     {
         route.bus_number = Reader::convertToInt(Reader::readToken(input, COLON));
     }
+    virtual void ParseFromJson(const Json::Node& node) override
+    {   
+        GetId(node);
+        auto data = node.AsMap();
+        route.bus_number = std::stoi(data.at("name").AsString());
+    }
 
-    virtual std::string Process(const DB& db) const override;
+    virtual Json::Node Process(const DB& db) const override;
 };
 
 struct GetStopRequest : GetRequest, StopRequest
@@ -292,8 +344,14 @@ struct GetStopRequest : GetRequest, StopRequest
     {
         stop.name = Reader::readToken(input, COLON);
     }
+    virtual void ParseFromJson(const Json::Node& node) override
+    {
+        GetId(node);
+        auto data = node.AsMap();
+        stop.name = data.at("name").AsString();
+    }
 
-    virtual std::string Process(const DB& db) const override;
+    virtual Json::Node Process(const DB& db) const override;
 };
 
 
@@ -370,7 +428,7 @@ public:
     ~DB() = default;
 
     void processGetRequests(const std::vector<RequestHolder>& requests,
-                            std::vector<std::string>& responses)
+                            std::optional<std::reference_wrapper<Json::Node>> responses = std::nullopt)
     {
         processRequests(requests, responses);
     }
@@ -382,7 +440,7 @@ public:
     }
 
     void processRequests(const std::vector<RequestHolder>& requests,
-                        std::optional<std::reference_wrapper<std::vector<std::string>>> responses = std::nullopt)
+                        std::optional<std::reference_wrapper<Json::Node>> responses = std::nullopt)
     {
         for (const auto& requestHolder : requests)
         {
@@ -393,7 +451,7 @@ public:
 
                 if (responses)
                 {
-                    responses->get().push_back(response);
+                    responses->get().AsArray().push_back(response);
                 }
             }
             else
@@ -436,60 +494,44 @@ public:
         return res;
     }
 
-    std::string getBusData(BusNumber busNumber) const
+    Json::Node getBusData(BusNumber busNumber) const
     {
         auto bus = routes.find(busNumber);
-        std::string response = "Bus " + std::to_string(busNumber) + ": ";
+        std::map<std::string, Json::Node> response;
 
         if (bus == routes.end())
         {
-            response += "not found";
+            response["error_message"] = "not found";
         }
         else
         {   
             auto& route = bus->second;
-            std::stringstream ss;
 
-            ss << setprecision(7);
-            ss << response;
-            ss << route.stops.size()
-                    << " stops on route, "
-                    << route.unique_stops.size()
-                    << " unique stops, "
-                    <<  route.LengthRoad
-                    <<  " route length, "
-                    << route.Curvature
-                    << " curvature";
-            response = ss.str();
+            response["curvature"] =  route.Curvature;
+            response["route_length"] = route.LengthRoad;
+            response["stop_count"] = static_cast<int>(route.stops.size());
+            response["unique_stop_count"] = static_cast<int>(route.unique_stops.size());
         }
         return response;
     }
 
-    std::string getStopData(const std::string& stopName) const
+    Json::Node getStopData(const std::string& stopName) const
     {
         auto stop = stops.find(std::string(stopName));
-        std::string response = "Stop " + std::string(stopName) + ": ";
+        std::map<std::string, Json::Node> response;
 
         if (stop == stops.end())
         {
-            response += "not found";
+            response["error_message"];
         }
         else
         {
-            auto& busses = stop->second.buses;
-            
-            if (busses.empty())
+            std::vector<Json::Node> buses;
+            for (const auto& bus : stop->second.buses)
             {
-                response += "no buses";
+                buses.push_back(std::to_string(bus));
             }
-            else
-            {
-                response += "buses";
-                for (const auto& bus : busses)
-                {
-                    response += " " + std::to_string(bus);
-                }
-            }
+            response["buses"] = buses;
         }
 
         return response;
@@ -554,14 +596,22 @@ void PostStopRequest::Process(DB& db) const
     db.addStop(stop);
 }
 
-std::string GetBusRequest::Process(const DB& db) const
+Json::Node GetBusRequest::Process(const DB& db) const
 {
-    return db.getBusData(route.bus_number);
+    auto response = db.getBusData(route.bus_number);
+
+    response.AsMap()["request_id"] = static_cast<int>(id);
+
+    return response;
 }
 
-std::string GetStopRequest::Process(const DB& db) const
+Json::Node GetStopRequest::Process(const DB& db) const
 {
-    return db.getStopData(std::string(stop.name));
+    auto response =  db.getStopData(std::string(stop.name));
+
+    response.AsMap()["request_id"] = static_cast<int>(id);
+
+    return response;
 }
 
 class Input final : public Singleton<Input>
@@ -569,6 +619,28 @@ class Input final : public Singleton<Input>
     friend class Singleton<Input>;
 public:
     ~Input() = default;
+    std::pair<std::vector<RequestHolder>, std::vector<RequestHolder>> readRequests(const Json::Document& json)
+    {
+        std::vector<RequestHolder> postRequests;
+        std::vector<RequestHolder> getRequests;
+
+        auto baseRequests = json.GetRoot().AsMap().at("base_requests");
+        auto statRequests = json.GetRoot().AsMap().at("stat_requests");
+
+        for (const auto &requestJson : baseRequests.AsArray())
+        {
+            auto request = parseRequestJson(requestJson, Request::Type::POST);
+            postRequests.push_back(std::move(request));
+        }
+        for (const auto &requestJson : statRequests.AsArray())
+        {
+            auto request = parseRequestJson(requestJson, Request::Type::GET);
+            getRequests.push_back(std::move(request));
+        }
+
+        return std::make_pair(std::move(postRequests), std::move(getRequests));
+    }
+
     std::vector<RequestHolder> readPostRequests(std::istream& in_stream = std::cin)
     {
         return readRequests(Request::Type::POST, in_stream);
@@ -616,6 +688,22 @@ private:
         return request;
     }
 
+    RequestHolder parseRequestJson(const Json::Node& node, Request::Type type)
+    {
+        const auto request_option = convertRequestOptionFromString(node.AsMap().at("type").AsString());
+        if (!request_option)
+        {
+            return nullptr;
+        }
+        RequestHolder request = Request::Create(type, *request_option);
+        if (request)
+        {
+            request->ParseFromJson(node);
+        };
+
+        return request;
+    }
+
     std::optional<Request::Option> convertRequestOptionFromString(std::string_view option_str)
     {
         if (const auto it = STR_TO_REQUEST_OPTION.find(option_str);
@@ -639,25 +727,6 @@ private:
         getline(stream, dummy);
 
         return number;
-    }
-};
-
-class Output final : public Singleton<Output>
-{
-    friend class Singleton<Output>;
-public:
-    ~Output() = default;
-    void printResponses(std::vector<std::string>& responses)
-    {
-        for (const auto& response : responses)
-        {
-            printLine(response);
-        }
-    }
-    template <typename Data>
-    void printLine(Data data, std::ostream& out = std::cout)
-    {
-        out << data << std::endl;
     }
 };
 
@@ -716,150 +785,136 @@ void testParsingGetBus()
 
     AssertEqual(gs.route.bus_number, 750, std::string(str));
     //--
-}
+} 
 
-void testA()
-{
-    std::stringstream ss1, ss2;
-
-    DB db;
-    std::vector<RequestHolder> requests;
-    std::vector<std::string> responses;
-
-    ss1 << "10\n"
-        "Stop Tolstopaltsevo: 55.611087, 37.20829\n"
-        "Stop Marushkino: 55.595884, 37.209755\n"
-        "Bus 256: Biryulyovo Zapadnoye > Biryusinka > Universam > Biryulyovo Tovarnaya > Biryulyovo Passazhirskaya > Biryulyovo Zapadnoye\n"
-        "Bus 750: Tolstopaltsevo - Marushkino - Rasskazovka\n"
-        "Stop Rasskazovka: 55.632761, 37.333324\n"
-        "Stop Biryulyovo Zapadnoye: 55.574371, 37.6517\n"
-        "Stop Biryusinka: 55.581065, 37.64839\n"
-        "Stop Universam: 55.587655, 37.645687\n"
-        "Stop Biryulyovo Tovarnaya: 55.592028, 37.653656\n"
-        "Stop Biryulyovo Passazhirskaya: 55.580999, 37.659164";
-    requests = Input::get()->readPostRequests(ss1);
-    db.processPostRequests(requests);
-    ss2 << "3\n"
-        "Bus 750\n"
-        "Bus 256\n"
-        "Bus 751";
-    requests = Input::get()->readGetRequests(ss2);
-    db.processGetRequests(requests, responses);
-
-    std::vector<Response> correct_responses =
+class FileReader {
+public:
+    enum class Option
     {
-        "Bus 750: 5 stops on route, 3 unique stops, 20939.5 route length",
-        "Bus 256: 6 stops on route, 5 unique stops, 4371.02 route length",
-        "Bus 751: not found"
+        OPEN,
+        TRUNCATE
     };
 
-    AssertEqual(responses.size(), correct_responses.size(), "responses count");
-    for(int i = 0; i < responses.size(); i++)
+    FileReader(const std::string& fileName, std::optional<Option> option = Option::OPEN) : fileName(fileName)
     {
-        AssertEqual(responses[i], correct_responses[i]);
-    }
-}
+       inputFile.open(fileName, option == Option::TRUNCATE ? std::ios::out | std::ios::trunc : std::ios::in);
 
-void testB()
+        if (!inputFile.is_open())
+        {
+            throw(std::invalid_argument("could not open file " + fileName));
+        }
+    }
+
+    FileReader(char* fileName) : FileReader(std::string(fileName)) {}
+
+    ~FileReader()
+    {
+        if (inputFile.is_open())
+        {
+            inputFile.close();
+        }
+    }
+
+    void clear()
+    {
+        inputFile.close();
+        inputFile.open(fileName, std::ios::trunc);
+    }
+
+    Json::Document Load()
+    {
+        return Json::Load(inputFile);
+    }
+
+    void Write(const Json::Document& doc)
+    {
+        printNode(doc.GetRoot());
+    }
+
+    void printArray(const Json::Node &node) {
+        inputFile << '[';
+        bool first = true;
+        for (auto &item : node.AsArray()) {
+            if (first) {
+                first = false;
+            } else {
+                inputFile << ",";
+            }
+            printNode(item);
+        }
+        inputFile << ']';
+    }
+
+    void printInt(const Json::Node &node) {
+        inputFile << node.AsInt();
+    }
+
+    void printString(const Json::Node &node) {
+        inputFile << "\"" << node.AsString() << "\"";
+    }
+
+    void printDouble(const Json::Node &node) {
+        inputFile << node.AsDouble();
+    }
+
+    void printMap(const Json::Node &node) {
+        inputFile << '{';
+        bool first = true;
+        for (auto &[key, value] : node.AsMap()) {
+            if (first) {
+                first = false;
+            } else {
+                inputFile << ",";
+            }
+            inputFile << "\"" << key << "\"" << ": ";
+            printNode(value);
+        }
+        inputFile << '}';
+    }
+
+    void printNode(const Json::Node &node) {
+        switch (node.getType()) {
+        case Json::Node::Type::ARRAY:
+            printArray(node);
+            break;
+        case Json::Node::Type::MAP:
+            printMap(node);
+            break;
+        case Json::Node::Type::INT:
+            printInt(node);
+            break;
+        case Json::Node::Type::STRING:
+            printString(node);
+            break;
+        case Json::Node::Type::DOUBLE:
+            printDouble(node);
+            break;
+        default:
+            break;
+        }
+    }
+private:
+    std::string fileName;
+    std::fstream inputFile;
+};
+
+void testD()
 {
-    std::stringstream ss1, ss2;
+    FileReader request_file("requests.txt");
+    FileReader correct_response_file("correct_responses.txt");
+    FileReader response_file("responses.txt", FileReader::Option::TRUNCATE);
 
-    DB db;
-    std::vector<RequestHolder> requests;
-    std::vector<std::string> responses;
+    auto requests = request_file.Load();
+    auto correct_responses = correct_response_file.Load();
+    auto responses = Json::Node();
 
-    ss1 << "13\n"
-            "Stop Tolstopaltsevo: 55.611087, 37.20829\n"
-            "Stop Marushkino: 55.595884, 37.209755\n"
-            "Bus 256: Biryulyovo Zapadnoye > Biryusinka > Universam > Biryulyovo Tovarnaya > Biryulyovo Passazhirskaya > Biryulyovo Zapadnoye\n"
-            "Bus 750: Tolstopaltsevo - Marushkino - Rasskazovka\n"
-            "Stop Rasskazovka: 55.632761, 37.333324\n"
-            "Stop Biryulyovo Zapadnoye: 55.574371, 37.6517\n"
-            "Stop Biryusinka: 55.581065, 37.64839\n"
-            "Stop Universam: 55.587655, 37.645687\n"
-            "Stop Biryulyovo Tovarnaya: 55.592028, 37.653656\n"
-            "Stop Biryulyovo Passazhirskaya: 55.580999, 37.659164\n"
-            "Bus 828: Biryulyovo Zapadnoye > Universam > Rossoshanskaya ulitsa > Biryulyovo Zapadnoye\n"
-            "Stop Rossoshanskaya ulitsa: 55.595579, 37.605757\n"
-            "Stop Prazhskaya: 55.611678, 37.603831";
-    requests = Input::get()->readPostRequests(ss1);
-    db.processPostRequests(requests);
-    ss2 << "6\n"
-            "Bus 256\n"
-            "Bus 750\n"
-            "Bus 751\n"
-            "Stop Samara\n"
-            "Stop Prazhskaya\n"
-            "Stop Biryulyovo Zapadnoye";
-    requests = Input::get()->readGetRequests(ss2);
-    db.processGetRequests(requests, responses);
+    DB db;    
+    auto [postRequests, getRequests] = Input::get()->readRequests(requests);
 
-    std::vector<Response> correct_responses =
-    {
-        "Bus 256: 6 stops on route, 5 unique stops, 4371.02 route length",
-        "Bus 750: 5 stops on route, 3 unique stops, 20939.5 route length",
-        "Bus 751: not found",
-        "Stop Samara: not found",
-        "Stop Prazhskaya: no buses",
-        "Stop Biryulyovo Zapadnoye: buses 256 828"
-    };
+    db.processPostRequests(postRequests);
+    db.processGetRequests(getRequests, responses);
 
-    AssertEqual(responses.size(), correct_responses.size(), "responses count");
-    for(int i = 0; i < responses.size(); i++)
-    {
-        AssertEqual(responses[i], correct_responses[i], correct_responses[i]);
-    }
-}
-
-void testC()
-{
-    std::stringstream ss1, ss2;
-
-    DB db;
-    std::vector<RequestHolder> requests;
-    std::vector<std::string> responses;
-
-    ss1 << "13\n"
-            "Stop Tolstopaltsevo: 55.611087, 37.20829, 3900m to Marushkino\n"
-            "Stop Marushkino: 55.595884, 37.209755, 9900m to Rasskazovka\n"
-            "Bus 256: Biryulyovo Zapadnoye > Biryusinka > Universam > Biryulyovo Tovarnaya > Biryulyovo Passazhirskaya > Biryulyovo Zapadnoye\n"
-            "Bus 750: Tolstopaltsevo - Marushkino - Rasskazovka\n"
-            "Stop Rasskazovka: 55.632761, 37.333324\n"
-            "Stop Biryulyovo Zapadnoye: 55.574371, 37.6517, 7500m to Rossoshanskaya ulitsa, 1800m to Biryusinka, 2400m to Universam\n"
-            "Stop Biryusinka: 55.581065, 37.64839, 750m to Universam\n"
-            "Stop Universam: 55.587655, 37.645687, 5600m to Rossoshanskaya ulitsa, 900m to Biryulyovo Tovarnaya\n"
-            "Stop Biryulyovo Tovarnaya: 55.592028, 37.653656, 1300m to Biryulyovo Passazhirskaya\n"
-            "Stop Biryulyovo Passazhirskaya: 55.580999, 37.659164, 1200m to Biryulyovo Zapadnoye\n"
-            "Bus 828: Biryulyovo Zapadnoye > Universam > Rossoshanskaya ulitsa > Biryulyovo Zapadnoye\n"
-            "Stop Rossoshanskaya ulitsa: 55.595579, 37.605757\n"
-            "Stop Prazhskaya: 55.611678, 37.603831";
-    requests = Input::get()->readPostRequests(ss1);
-    db.processPostRequests(requests);
-    ss2 <<  "6\n"
-            "Bus 256\n"
-            "Bus 750\n"
-            "Bus 751\n"
-            "Stop Samara\n"
-            "Stop Prazhskaya\n"
-            "Stop Biryulyovo Zapadnoye";
-    requests = Input::get()->readGetRequests(ss2);
-    db.processGetRequests(requests, responses);
-
-    std::vector<Response> correct_responses =
-    {
-        "Bus 256: 6 stops on route, 5 unique stops, 5950 route length, 1.361239 curvature",
-        "Bus 750: 5 stops on route, 3 unique stops, 27600 route length, 1.318084 curvature",
-        "Bus 751: not found",
-        "Stop Samara: not found",
-        "Stop Prazhskaya: no buses",
-        "Stop Biryulyovo Zapadnoye: buses 256 828"
-    };
-
-    AssertEqual(responses.size(), correct_responses.size(), "responses count");
-    for(int i = 0; i < responses.size(); i++)
-    {
-        AssertEqual(responses[i], correct_responses[i]);
-    }
+    response_file.Write(Json::Document(responses));
 }
 
 int main()
@@ -870,18 +925,8 @@ int main()
     RUN_TEST(tr, testParsingPostBus);
     RUN_TEST(tr, testParsingPostStop);
     RUN_TEST(tr, testParsingGetBus);
-    RUN_TEST(tr, testC);
+    RUN_TEST(tr, testD);
     //
-
-    DB db;
-    std::vector<RequestHolder> requests;
-    std::vector<std::string> responses;
-
-    requests = Input::get()->readPostRequests();
-    db.processPostRequests(requests);
-    requests = Input::get()->readGetRequests();
-    db.processGetRequests(requests, responses);
-    Output::get()->printResponses(responses);
 
     return 0;
 }
